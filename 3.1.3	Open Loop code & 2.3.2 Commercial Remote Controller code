@@ -1,0 +1,727 @@
+#include <math.h>
+#include <Wire.h>
+
+#define NUM_MOTORS 4
+#define I2C_Freq 400000
+#ifndef PI
+#define PI 3.14159265358979f
+#endif
+
+// ════════════════════════════════════════════════════════════════════
+//  STRUCT DEFINITIONS
+// ════════════════════════════════════════════════════════════════════
+struct PIDSTATE {
+  float prev_error;
+  float prev_rate;
+  float i;
+  float prev_d; 
+};
+
+struct PIDSTATE_ANGLE {
+  float prev_error;
+  float i;
+};
+
+struct RCState {
+  uint16_t ch[10];      // raw PWM 1000–2000 for all 10 channels
+  float    throttle;    // 0.0–1.0  (CH3)
+  float    roll;        // -1.0–+1.0 (CH1, deadband applied)
+  float    pitch;       // -1.0–+1.0 (CH2, deadband applied)
+  float    yaw;         // -1.0–+1.0 (CH4, deadband applied)
+  bool     armed;       // true = SwA DOWN
+  bool     signalLost;
+};
+
+// ════════════════════════════════════════════════════════════════════
+//  iBUS RC INPUT
+// ════════════════════════════════════════════════════════════════════
+RCState rc;
+
+static uint8_t  ib_buf[32];
+static uint8_t  ib_idx     = 0;
+static bool     ib_synced  = false;
+static uint32_t ib_lastMs  = 0;
+static bool     ib_prevArm = false;
+
+float applyDeadband(float v, float db) {
+  if (fabsf(v) < db) return 0.0f;
+  return (v > 0.0f) ? (v - db) / (1.0f - db) : (v + db) / (1.0f - db);
+}
+
+void updateIBUS() {
+  while (Serial1.available()) {
+    uint8_t b = Serial1.read();
+
+    if (!ib_synced) {
+      if (b == 0x20) { ib_buf[0] = b; ib_idx = 1; ib_synced = true; }
+      continue;
+    }
+
+    ib_buf[ib_idx++] = b;
+
+    if (ib_idx == 2 && b != 0x40) { ib_synced = false; ib_idx = 0; continue; }
+    if (ib_idx < 32) continue;
+
+    ib_synced = false; ib_idx = 0;
+
+    uint16_t chk = 0xFFFF;
+    for (int i = 0; i < 30; i++) chk -= ib_buf[i];
+    if (chk != (ib_buf[30] | ((uint16_t)ib_buf[31] << 8))) continue;
+
+    for (int i = 0; i < 10; i++)
+      rc.ch[i] = ib_buf[2 + i*2] | ((uint16_t)ib_buf[3 + i*2] << 8);
+
+    ib_lastMs = millis();
+  }
+
+  rc.signalLost = (millis() - ib_lastMs > 500);
+  if (rc.signalLost) {
+    rc.throttle = 0.0f; rc.roll = 0.0f; rc.pitch = 0.0f; rc.yaw = 0.0f;
+    rc.armed    = false;
+    return;
+  }
+
+  rc.roll     = applyDeadband(constrain((float)(rc.ch[0]-1500)/500.f, -1.f, 1.f), 0.05f);
+  rc.pitch    = applyDeadband(constrain((float)(rc.ch[1]-1500)/500.f, -1.f, 1.f), 0.05f);
+  rc.throttle = constrain((float)(rc.ch[2]-1000)/1000.f, 0.f, 1.f);
+  rc.yaw      = applyDeadband(constrain((float)(rc.ch[3]-1500)/500.f, -1.f, 1.f), 0.05f);
+
+  bool armSw = (rc.ch[4] < 1300);
+  if (armSw && !ib_prevArm && rc.ch[2] < 1100) rc.armed = true; 
+  if (!armSw)                                  rc.armed = false;
+  ib_prevArm = armSw;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  TUNING
+// ════════════════════════════════════════════════════════════════════
+const float MAX_ANGLE_RAD = 40.0f * (PI / 180.0f);
+const float MAX_YAW_RATE  = 1.5f;
+
+float roll_rate_ref  = 0.0f;
+float pitch_rate_ref = 0.0f;
+float yaw_rate_ref   = 0.0f;
+
+float roll_ref  = 0.0f;
+float pitch_ref = 0.0f;
+float yaw_ref   = 0.0f;
+
+float base_pwm = 1050.0f; 
+
+// roll PID gains
+float kp_roll = 4.0f;
+float ki_roll = 0.5f;
+float kd_roll = 1.0f;
+
+// roll_rate PID gains
+float kp_roll_rate = 50.0f;
+float ki_roll_rate = 0.1f;
+float kd_roll_rate = 0.07f;
+
+const float gyro_alpha = 0.9f;
+float beta2 = 0.02f;//0.03
+float beta = 0.00005f;
+float gain = 0.00000001f;
+
+// pitch PID gains
+float kp_pitch = 4.0f;     //4                   
+float ki_pitch = 0.5f;      //48                 
+float kd_pitch = 1.0f; //55
+
+// pitch_rate PID gains
+float kp_pitch_rate = 50.0f;   //70
+float ki_pitch_rate = 0.1f;  //30
+float kd_pitch_rate = 0.07f;  //0.07
+
+// yaw PID gains
+float kp_yaw = 12.0f; //6  //10
+float ki_yaw = 0.5f; //0.5 
+float kd_yaw = 1.0f; //1
+
+// yaw_rate PID gains
+float kp_yaw_rate = 80.0f;  //20     //5.0
+float ki_yaw_rate = 0.5f;   //1.0   //0.0
+float kd_yaw_rate = 0.07f;   //0.4    //0.4
+
+float roll_out = 0.0f; 
+float pitch_out = 0.0f; 
+float yaw_out = 0.0f;
+
+// ════════════════════════════════════════════════════════════════════
+//  HARDWARE
+// ════════════════════════════════════════════════════════════════════
+const int motorPin[NUM_MOTORS] = {6, 9, 14, 23};
+
+// ════════════════════════════════════════════════════════════════════
+//  IMU
+// ════════════════════════════════════════════════════════════════════
+const uint8_t ADDR_MPU   = 0x68;
+const int ADDR_MAG       = 0x0D; 
+const float ACCEL_SENS   = 4096.0f;
+const float G_TO_MS2     = 9.80665f;
+const float GYRO_SENS    = 16.4f;
+const float DEG2RAD      = (PI / 180.0f);
+
+float accel_x_bias = 0.0f, accel_y_bias = 0.0f, accel_z_bias = 0.0f;
+float gyro_x_bias = 0.0f, gyro_y_bias = 0.0f, gyro_z_bias = 0.0f;
+
+float gx_prev = 0.0f, gy_prev = 0.0f, gz_prev = 0.0f;
+float mx_read_prev = 0.0f, my_read_prev = 0.0f, mz_read_prev = 0.0f;
+
+float magBias[3] = {-13.10, -68.75, -180.01};
+float magScale[3] = {1.16, 0.85, 1.04};
+
+float q[4] = {1,0,0,0}, q_1[4] = {1,0,0,0}, q_c[4] = {1,0,0,0};
+float intg[4] = {0,0,0,0}, E_b[4] = {0,0,0,0}, step[4] = {0,0,0,0};
+float w_c[4] = {0,0,0,0}, output[4] = {0,0,0,0}, q_dev[4] = {0,0,0,0};
+
+int temp_roll = 0, temp_pitch = 0, temp_yaw = 0;
+int temp_yg = 0, temp_rg = 0, temp_pg = 0;
+int pitch = 0, roll = 0, yaw = 0;
+
+float roll_f = 0.0f, pitch_f = 0.0f, yaw_f = 0.0f;
+float roll_f_2 = 0.0f, pitch_f_2 = 0.0f, yaw_f_2 = 0.0f;
+float dt = 0.0f, dt1 = 0.0f, dt2 = 0.0f;
+
+float wx_f = 0.0f, wy_f = 0.0f, wz_f = 0.0f;
+float mx_read_f = 0.0f, my_read_f = 0.0f, mz_read_f = 0.0f;
+float ax, ay, az, wx, wy, wz;
+float mx_read, my_read, mz_read;
+
+// ════════════════════════════════════════════════════════════════════
+//  PID STATE INITIALIZATION
+// ════════════════════════════════════════════════════════════════════
+PIDSTATE_ANGLE pid_roll  = {0, 0};
+PIDSTATE_ANGLE pid_pitch = {0, 0};
+PIDSTATE_ANGLE pid_yaw   = {0, 0};
+
+PIDSTATE pid_roll_rate  = {0, 0, 0, 0};
+PIDSTATE pid_pitch_rate = {0, 0, 0, 0};
+PIDSTATE pid_yaw_rate   = {0, 0, 0, 0};
+
+// ════════════════════════════════════════════════════════════════════
+//  LOOP TIMING
+// ════════════════════════════════════════════════════════════════════
+const unsigned long LOOP_PERIOD_US_RATE = 2222;
+const unsigned long LOOP_PERIOD_US = 10000;
+unsigned long prevLoopTime_rate = 0;
+unsigned long prevLoopTime = 0;
+
+bool flag_kill = false;
+bool flag1 = false;
+bool flag2 = false;
+int once = 0;
+
+float roll_init  = 0.0f;
+float pitch_init = 0.0f;
+float yaw_init   = 0.0f;
+
+float m0 = 0.0f; 
+float m1 = 0.0f; 
+float m2 = 0.0f; 
+float m3 = 0.0f; 
+
+// ════════════════════════════════════════════════════════════════════
+//  PID FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+float pid_calc_rate(float error, float rate, float dt, float kp, float ki, float kd, PIDSTATE *state) {
+  if (fabsf(error) < 0.3f) {
+    state->i += error * dt;
+    state->i  = constrain(state->i, -4.0f, 4.0f);
+  }
+  float d_raw = (rate - state->prev_rate) / dt;
+  float d = 0.9f * state->prev_d + 0.1f * d_raw;
+  state->prev_d = d;
+  state->prev_rate = rate;
+  state->prev_error = error;
+  return kp * error + ki * state->i - kd * d;
+}
+
+float pid_calc(float error, float angle, float rate, float dt, float kp, float ki, float kd, PIDSTATE_ANGLE *state) {
+  if (fabsf(error) < 15.0f) {
+    state->i += error * dt;
+    state->i  = constrain(state->i, -4.0f, 4.0f);
+  }
+  float d = rate;
+  state->prev_error = error;
+  return kp * error + ki * state->i - kd * d;
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  MOTOR MIXER (Full X-Frame 4-Motor Mix)
+// ════════════════════════════════════════════════════════════════════
+void motor_mixer(float roll_out, float pitch_out, float yaw_out, float *m0, float *m1, float *m2, float *m3) {
+  *m0 = base_pwm + roll_out + pitch_out + yaw_out;
+  *m1 = base_pwm - roll_out + pitch_out - yaw_out;
+  *m2 = base_pwm - roll_out - pitch_out + yaw_out;
+  *m3 = base_pwm + roll_out - pitch_out - yaw_out;
+
+  // Rescale if any motor saturates, preserving relative ratios
+  float max_pwm = max(max(*m0, *m1), max(*m2, *m3));
+  float min_pwm = min(min(*m0, *m1), min(*m2, *m3));
+
+  if (max_pwm > 1800.0f) {
+    float excess = max_pwm - 1800.0f;
+    *m0 -= excess; *m1 -= excess; *m2 -= excess; *m3 -= excess;
+  }
+  if (min_pwm < 1050.0f) {
+    float deficit = 1050.0f - min_pwm;
+    *m0 += deficit; *m1 += deficit; *m2 += deficit; *m3 += deficit;
+  }
+
+  int motorCommand1 = map(*m0, 1000, 2000, 1843, 3686);
+  int motorCommand2 = map(*m1, 1000, 2000, 1843, 3686);
+  int motorCommand3 = map(*m2, 1000, 2000, 1843, 3686);
+  int motorCommand4 = map(*m3, 1000, 2000, 1843, 3686);
+
+  analogWrite(motorPin[0], motorCommand1);
+  analogWrite(motorPin[1], motorCommand2);
+  analogWrite(motorPin[2], motorCommand3);
+  analogWrite(motorPin[3], motorCommand4);
+}
+
+void motorsOff() {
+  analogWrite(motorPin[0], 1843);
+  analogWrite(motorPin[1], 1843);
+  analogWrite(motorPin[2], 1843);
+  analogWrite(motorPin[3], 1843);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  IMU FUNCTIONS
+// ════════════════════════════════════════════════════════════════════
+void setupMPU6050() {
+  Wire1.begin(); Wire1.setClock(I2C_Freq);
+  Wire1.beginTransmission(ADDR_MPU); Wire1.write(0x6B); Wire1.write(0x00); Wire1.endTransmission();
+  Wire1.beginTransmission(ADDR_MPU); Wire1.write(0x1C); Wire1.write(0x10); Wire1.endTransmission();
+  Wire1.beginTransmission(ADDR_MPU); Wire1.write(0x1B); Wire1.write(0x18); Wire1.endTransmission();
+}
+
+void setupQMC() {
+  Wire1.begin(); Wire1.setClock(I2C_Freq);
+  Wire1.beginTransmission(ADDR_MAG); Wire1.write(0x0B); Wire1.write(0x01); Wire1.endTransmission();
+  Wire1.beginTransmission(ADDR_MAG); Wire1.write(0x09); Wire1.write(0x59); Wire1.endTransmission();
+}
+
+bool readMPU(float &ax, float &ay, float &az, float &wx, float &wy, float &wz) {
+  Wire1.beginTransmission(ADDR_MPU); Wire1.write(0x3B); Wire1.endTransmission(false);
+  uint8_t count = Wire1.requestFrom(ADDR_MPU, (uint8_t)14);
+  if (count < 14) return false;
+
+  int16_t rawAx = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawAy = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawAz = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawTemp = (int16_t)(Wire1.read() << 8 | Wire1.read()); (void)rawTemp;
+  int16_t rawGx = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawGy = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawGz = (int16_t)(Wire1.read() << 8 | Wire1.read());
+
+  ax = ( (float)rawAx / ACCEL_SENS ) * G_TO_MS2 - accel_x_bias;
+  ay = ( (float)rawAy / ACCEL_SENS ) * G_TO_MS2 - accel_y_bias;
+  az = ( (float)rawAz / ACCEL_SENS ) * G_TO_MS2 - accel_z_bias;
+
+  wx = ( (float) rawGx / GYRO_SENS ) * DEG2RAD - gyro_x_bias;
+  wy = ( (float) rawGy / GYRO_SENS ) * DEG2RAD - gyro_y_bias;
+  wz = ( (float) rawGz / GYRO_SENS ) * DEG2RAD - gyro_z_bias;
+  return true;
+}
+
+bool readMag(float &mx, float &my, float &mz,float *magBias , float *magScale) {
+  Wire1.beginTransmission(ADDR_MAG); Wire1.write(0x00); Wire1.endTransmission(false);
+  uint8_t count = Wire1.requestFrom((uint8_t)ADDR_MAG, (uint8_t)6);
+  if (count < 6) return false;
+
+  uint8_t xl = Wire1.read(), xh = Wire1.read();
+  uint8_t yl = Wire1.read(), yh = Wire1.read();
+  uint8_t zl = Wire1.read(), zh = Wire1.read();
+
+  int16_t rawX = (int16_t)((xh << 8) | xl);
+  int16_t rawY = (int16_t)((yh << 8) | yl);
+  int16_t rawZ = (int16_t)((zh << 8) | zl);
+
+  mx = (rawX - magBias[0]) * magScale[0];
+  my = (rawY - magBias[1]) * magScale[1];
+  mz = (rawZ - magBias[2]) * magScale[2];
+  return true;
+}
+
+void calibrateGyro(int samples=500, int delayMs=5) {
+  long gx_sum=0, gy_sum=0, gz_sum=0;
+  for (int i=0;i<samples;i++){
+    float ax,ay,az, gx,gy,gz;
+    if (!readMPU(ax,ay,az,gx,gy,gz)) { delay(5); --i; continue; }
+    gx_sum += (long)(gx * 1e6f);
+    gy_sum += (long)(gy * 1e6f);
+    gz_sum += (long)(gz * 1e6f);
+    delay(delayMs);
+  }
+  gyro_x_bias = (float)gx_sum / (samples * 1e6f);
+  gyro_y_bias = (float)gy_sum / (samples * 1e6f);
+  gyro_z_bias = (float)gz_sum / (samples * 1e6f);
+  Serial.print("Gyro biases (rad/s): ");
+  Serial.print(gyro_x_bias,6); Serial.print(", ");
+  Serial.print(gyro_y_bias,6); Serial.print(", ");
+  Serial.println(gyro_z_bias,6);
+}
+
+void normalizeVec3(float &x, float &y, float &z) {
+  float n = sqrtf(x*x + y*y + z*z);
+  if (n > 1e-8f) { x /= n; y /= n; z /= n; } else { x = 0.0f; y = 0.0f; z = 1.0f; }
+}
+
+void q_conj(float q_in[4], float q_out[4]){ q_out[0]=q_in[0]; q_out[1]=-q_in[1]; q_out[2]=-q_in[2]; q_out[3]=-q_in[3]; }
+
+void quat_mult(float L[4], float R[4] , float product[4]){
+    product[0] = (L[0] * R[0]) - (L[1] * R[1]) - (L[2] * R[2]) - (L[3] * R[3]);
+    product[1] = (L[0] * R[1]) + (L[1] * R[0]) + (L[2] * R[3]) - (L[3] * R[2]);
+    product[2] = (L[0] * R[2]) - (L[1] * R[3]) + (L[2] * R[0]) + (L[3] * R[1]);
+    product[3] = (L[0] * R[3]) + (L[1] * R[2]) - (L[2] * R[1]) + (L[3] * R[0]);
+}
+void quat_sum(float L[4],float R[4] , float sum[4]){ sum[0]=L[0]+R[0]; sum[1]=L[1]+R[1]; sum[2]=L[2]+R[2]; sum[3]=L[3]+R[3]; }
+void quat_sub(float L[4],float R[4] , float sub[4]){ sub[0]=L[0]-R[0]; sub[1]=L[1]-R[1]; sub[2]=L[2]-R[2]; sub[3]=L[3]-R[3]; }
+void quat_scaler(float q[4] , float scaler,float q_scale[4]){ q_scale[0]=q[0]*scaler; q_scale[1]=q[1]*scaler; q_scale[2]=q[2]*scaler; q_scale[3]=q[3]*scaler; }
+
+void gbdc(float q_est[4], float step[4], float dt, float intg[4],float gain,float wx,float wy,float wz, float out[4]){
+    float prod[4], q_est_c[4], w[4] = {0,wx,wy,wz}, input[4]; 
+    q_conj( q_est, q_est_c); quat_mult( q_est_c, step , prod); 
+    quat_scaler(prod , 2,prod); quat_scaler(prod , dt,prod); 
+    quat_sum(intg, prod , intg); intg[0] = 0.0f;
+    quat_scaler(intg , gain,input); quat_sub(w,input , out); 
+}
+
+float invSqrt(float x) {
+  float hx = 0.5f * x;
+  union { float f; long i; } u;
+  u.f = x;
+  u.i = 0x5f3759df - (u.i >> 1);
+  return u.f * (1.5f - (hx * u.f * u.f));
+}
+
+void MadgwickAHRSupdateIMU(float gx, float gy, float gz, float ax, float ay, float az, float dt);
+
+void MadgwickAHRSupdate(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz, float dt) {
+  float recipNorm, s0, s1, s2, s3, qDot1, qDot2, qDot3, qDot4, hx, hy;
+  float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+  float q0 = q_1[0], q1= q_1[1], q2 = q_1[2], q3 = q_1[3]; 
+
+  if((mx == 0.0f) && (my == 0.0f) && (mz == 0.0f)) { MadgwickAHRSupdateIMU(gx, gy, gz, ax, ay, az, dt); return; }
+
+  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+  if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+    recipNorm = invSqrt(ax * ax + ay * ay + az * az); ax *= recipNorm; ay *= recipNorm; az *= recipNorm;   
+    recipNorm = invSqrt(mx * mx + my * my + mz * mz); mx *= recipNorm; my *= recipNorm; mz *= recipNorm;
+
+    _2q0mx = 2.0f * q0 * mx; _2q0my = 2.0f * q0 * my; _2q0mz = 2.0f * q0 * mz; _2q1mx = 2.0f * q1 * mx;
+    _2q0 = 2.0f * q0; _2q1 = 2.0f * q1; _2q2 = 2.0f * q2; _2q3 = 2.0f * q3;
+    _2q0q2 = 2.0f * q0 * q2; _2q2q3 = 2.0f * q2 * q3;
+    q0q0 = q0 * q0; q0q1 = q0 * q1; q0q2 = q0 * q2; q0q3 = q0 * q3;
+    q1q1 = q1 * q1; q1q2 = q1 * q2; q1q3 = q1 * q3;
+    q2q2 = q2 * q2; q2q3 = q2 * q3; q3q3 = q3 * q3;
+
+    hx = mx * q0q0 - _2q0my * q3 + _2q0mz * q2 + mx * q1q1 + _2q1 * my * q2 + _2q1 * mz * q3 - mx * q2q2 - mx * q3q3;
+    hy = _2q0mx * q3 + my * q0q0 - _2q0mz * q1 + _2q1mx * q2 - my * q1q1 + my * q2q2 + _2q2 * mz * q3 - my * q3q3;
+    _2bx = sqrt(hx * hx + hy * hy); _2bz = -_2q0mx * q2 + _2q0my * q1 + mz * q0q0 + _2q1mx * q3 - mz * q1q1 + _2q2 * my * q3 - mz * q2q2 + mz * q3q3;
+    _4bx = 2.0f * _2bx; _4bz = 2.0f * _2bz;
+
+    s0 = -_2q2 * (2.0f * q1q3 - _2q0q2 - ax) + _2q1 * (2.0f * q0q1 + _2q2q3 - ay) - _2bz * q2 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q3 + _2bz * q1) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q2 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s1 = _2q3 * (2.0f * q1q3 - _2q0q2 - ax) + _2q0 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q1 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + _2bz * q3 * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q2 + _2bz * q0) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q3 - _4bz * q1) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s2 = -_2q0 * (2.0f * q1q3 - _2q0q2 - ax) + _2q3 * (2.0f * q0q1 + _2q2q3 - ay) - 4.0f * q2 * (1 - 2.0f * q1q1 - 2.0f * q2q2 - az) + (-_4bx * q2 - _2bz * q0) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (_2bx * q1 + _2bz * q3) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + (_2bx * q0 - _4bz * q2) * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    s3 = _2q1 * (2.0f * q1q3 - _2q0q2 - ax) + _2q2 * (2.0f * q0q1 + _2q2q3 - ay) + (-_4bx * q3 + _2bz * q1) * (_2bx * (0.5f - q2q2 - q3q3) + _2bz * (q1q3 - q0q2) - mx) + (-_2bx * q0 + _2bz * q2) * (_2bx * (q1q2 - q0q3) + _2bz * (q0q1 + q2q3) - my) + _2bx * q1 * (_2bx * (q0q2 + q1q3) + _2bz * (0.5f - q1q1 - q2q2) - mz);
+    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); 
+    s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+
+    float s[4] = {s0,s1,s2,s3}; gbdc( q, s, dt, intg,gain, gx,gy, gz, output);  
+    gx = output[1]; gy = output[2]; gz = output[3];   
+    
+    qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+    qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+    qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+    qDot1 -= beta * s0; qDot2 -= beta * s1; qDot3 -= beta * s2; qDot4 -= beta * s3;
+  }
+  q0 += qDot1 * dt; q1 += qDot2 * dt; q2 += qDot3 * dt; q3 += qDot4 * dt;
+  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q_1[0] = q0 * recipNorm; q_1[1] = q1 * recipNorm; q_1[2] = q2 * recipNorm; q_1[3] = q3 * recipNorm; 
+}
+
+void MadgwickAHRSupdateIMU(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
+  float recipNorm, s0, s1, s2, s3, qDot1, qDot2, qDot3, qDot4;
+  float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2 ,_8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
+  float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];  
+
+  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+  if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+    recipNorm = invSqrt(ax * ax + ay * ay + az * az); ax *= recipNorm; ay *= recipNorm; az *= recipNorm;   
+    _2q0 = 2.0f * q0; _2q1 = 2.0f * q1; _2q2 = 2.0f * q2; _2q3 = 2.0f * q3;
+    _4q0 = 4.0f * q0; _4q1 = 4.0f * q1; _4q2 = 4.0f * q2; _8q1 = 8.0f * q1; _8q2 = 8.0f * q2;
+    q0q0 = q0 * q0; q1q1 = q1 * q1; q2q2 = q2 * q2; q3q3 = q3 * q3;
+
+    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+    s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+    s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+    s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
+    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); 
+    s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+    
+    qDot1 -= beta2 * s0; qDot2 -= beta2 * s1; qDot3 -= beta2 * s2; qDot4 -= beta2 * s3;
+  }
+  q0 += qDot1 * dt; q1 += qDot2 * dt; q2 += qDot3 * dt; q3 += qDot4 * dt;
+  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+  q[0] = q0 * recipNorm; q[1] = q1 * recipNorm; q[2] = q2 * recipNorm; q[3] = q3 * recipNorm; 
+}
+
+void quatToEuler(float q0, float q1, float q2, float q3, float *roll_out, float *pitch_out, float *yaw_out) {
+    float sinr_cosp = 2.0f * (q0*q1 + q2*q3);
+    float cosr_cosp = 1.0f - 2.0f * (q1*q1 + q2*q2);
+    *roll_out = atan2f(sinr_cosp, cosr_cosp);
+
+    float sinp = 2.0f * (q0*q2 - q3*q1);
+    sinp = constrain(sinp, -1.0f, 1.0f);
+    *pitch_out = asinf(sinp);
+
+    float siny_cosp = 2.0f * (q0*q3 + q1*q2);
+    float cosy_cosp = 1.0f - 2.0f * (q2*q2 + q3*q3);
+    *yaw_out = atan2f(siny_cosp, cosy_cosp);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  TELEMETRY
+// ════════════════════════════════════════════════════════════════════
+unsigned long lastPrint = 0;
+
+void print_telemetry(float roll_6dof, float pitch_6dof, float yaw_9dof, float m0, float m1 ,float m2 ,float m3) {
+  if (millis() - lastPrint < 50) return;
+  lastPrint = millis();
+
+  if (rc.signalLost) {
+    Serial.print("[SIGNAL LOST] ");
+  } else if (flag_kill) {
+    Serial.print("[KILL]        ");
+  } else if (rc.armed) {
+    Serial.print("[ARMED]       ");
+  } else {
+    Serial.print("[DISARMED]    ");
+  }
+
+  Serial.print(" r:"); Serial.print(roll_6dof * (180.0f/PI), 2);
+  Serial.print(" p:"); Serial.print(pitch_6dof * (180.0f/PI), 2);
+  Serial.print(" y:"); Serial.print(yaw_9dof * (180.0f/PI), 2);
+  
+  Serial.print(" | pwm:"); Serial.print((int)base_pwm);
+  Serial.print("  m0: "); Serial.print(m0);
+  Serial.print("  m1: "); Serial.print(m1);
+  Serial.print("  m2: "); Serial.print(m2);
+  Serial.print("  m3: "); Serial.println(m3);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  // iBUS RC receiver on Pin 0 (Serial1)
+  Serial1.begin(115200);      
+  memset(&rc, 0, sizeof(rc));
+  Serial.println("iBUS RC initialized on Pin 0 (Serial1)");
+
+  setupMPU6050(); delay(5);
+  setupQMC();     delay(5);
+  calibrateGyro(1000, 3);
+  
+  float ax, ay, az, wx, wy, wz;
+  if (readMPU(ax, ay, az, wx, wy, wz)) {
+    float ax_m = ax; float ay_m = ay; float az_m = az;
+    normalizeVec3(ax_m, ay_m, az_m);
+
+    float roll0 = atan2f(ay_m, az_m); 
+    float pitch0 = atan2f(-ax_m, sqrtf(ay_m*ay_m + az_m*az_m)); 
+
+    float cr = cosf(roll0 * 0.5f); float sr = sinf(roll0 * 0.5f);
+    float cp = cosf(pitch0 * 0.5f); float sp = sinf(pitch0 * 0.5f);
+
+    q[0] = cr * cp; q[1] = sr * cp; q[2] = cr * sp; q[3] = -sr * sp; 
+    float n = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if (n > 1e-8f) { q[0]/=n; q[1]/=n; q[2]/=n; q[3]/=n; }
+  }
+
+  for (int i = 0; i < NUM_MOTORS; i++) {
+    pinMode(motorPin[i], OUTPUT);
+    analogWriteFrequency(motorPin[i], 450);
+  }
+  analogWriteResolution(12);
+  
+  motorsOff();
+  delay(2000); 
+
+  prevLoopTime = micros();
+  prevLoopTime_rate = micros();
+  Serial.println("Ready. Flip SwA DOWN (with throttle low) to arm.");
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  LOOP
+// ════════════════════════════════════════════════════════════════════
+void loop() {
+
+  // 1. Update RC every cycle
+  updateIBUS();
+
+  // 2. Timing Gates
+  unsigned long now = micros();
+  if (now - prevLoopTime_rate >= LOOP_PERIOD_US_RATE){ 
+    flag1 = true; 
+    dt1 = (now - prevLoopTime_rate) * 1e-6f;
+    prevLoopTime_rate = now;
+  }
+  if (now - prevLoopTime >= LOOP_PERIOD_US){ 
+    flag2 = true; 
+    dt2 = (now - prevLoopTime) * 1e-6f;
+    prevLoopTime = now;
+  }
+
+  // 3. Safety Switch / Disarm
+  if (!rc.armed || rc.signalLost || flag_kill) {
+    if (!rc.armed) {
+      pid_roll  = {0,0}; pid_pitch = {0,0}; pid_yaw = {0,0};
+      pid_roll_rate = {0,0,0,0}; pid_pitch_rate = {0,0,0,0}; pid_yaw_rate = {0,0,0,0};
+      roll_rate_ref = 0; pitch_rate_ref = 0; yaw_rate_ref = 0;
+      once      = false;
+      flag_kill = false;
+      yaw_ref   = 0.0f;
+    }
+    motorsOff();
+    print_telemetry(roll_f, pitch_f, yaw_f_2,m0,m1,m2,m3);
+    return;
+  }
+
+  // Throttle Mapping (1050 to 1800 based on stick)
+  base_pwm = 1050.0f + rc.throttle * 750.0f;
+
+  // 4. Rate Loop
+  if(flag1) {
+    flag1 = false; 
+
+    bool ok1 = readMPU(ax, ay, az, wx, wy, wz);
+    bool ok2 = readMag(mx_read, my_read, mz_read, magBias, magScale);
+    if (!ok2 || !ok1) return;
+    
+    // Low-pass filter
+    wx_f = gyro_alpha * gx_prev + (1.0f - gyro_alpha) * wx;
+    wy_f = gyro_alpha * gy_prev + (1.0f - gyro_alpha) * wy;
+    wz_f = gyro_alpha * gz_prev + (1.0f - gyro_alpha) * wz;
+    gx_prev = wx_f; gy_prev = wy_f; gz_prev = wz_f;
+
+    mx_read_f = mx_read_prev * gyro_alpha + (1.0f-gyro_alpha) * mx_read;
+    my_read_f = my_read_prev * gyro_alpha + (1.0f-gyro_alpha) * my_read;
+    mz_read_f = mz_read_prev * gyro_alpha + (1.0f-gyro_alpha) * mz_read;
+    mx_read_prev = mx_read_f; my_read_prev = my_read_f; mz_read_prev = mz_read_f;
+
+    // Safety cutoff
+    if (fabsf(wx_f) > 20.0f || fabsf(wy_f) > 20.0f) {
+      Serial.print("RATE LIMIT HIT — killing motors"); Serial.print("  ");
+      Serial.print("wx:  ");Serial.print(wx_f);Serial.print("wy: ");Serial.println(wy_f);   
+      flag_kill = true;
+      return;
+    }
+
+    roll_out  = pid_calc_rate(roll_rate_ref  - wy_f, wy_f, dt1, kp_roll_rate,  ki_roll_rate,  kd_roll_rate,  &pid_roll_rate);
+    pitch_out = pid_calc_rate(pitch_rate_ref + wx_f, -wx_f, dt1, kp_pitch_rate, ki_pitch_rate, kd_pitch_rate, &pid_pitch_rate);
+    yaw_out   = pid_calc_rate(yaw_rate_ref   - wz_f, wz_f, dt1, kp_yaw_rate,   ki_yaw_rate,   kd_yaw_rate,   &pid_yaw_rate);
+
+    roll_out  = constrain(roll_out, -80.0f, 80.0f);   // Tightened from 200 to 80
+    pitch_out = constrain(pitch_out, -80.0f, 80.0f);   // Tightened from 200 to 80
+    yaw_out   = constrain(yaw_out, -100.0f, 100.0f);
+
+    motor_mixer(roll_out, pitch_out, yaw_out, &m0, &m1, &m2, &m3);
+  }
+
+  // 5. Angle Loop
+  if(flag2) {
+    flag2 = false;
+
+    float ax_m = ax;   
+    float ay_m = ay;    
+    float az_m = az;   
+
+    normalizeVec3(ax_m, ay_m, az_m);
+    float mx_n = my_read_f, my_n = -mx_read_f, mz_n = mz_read_f;
+    normalizeVec3(mx_n, my_n, mz_n);
+    
+    MadgwickAHRSupdateIMU( -wx_f,wy_f, wz_f, ax_m, -ay_m, az_m, dt2) ; 
+    MadgwickAHRSupdate(-wx_f, wy_f, wz_f, ax_m, -ay_m, az_m, mx_n, my_n,  mz_n,dt2);
+    quatToEuler(q[0], q[1], q[2], q[3], &pitch_f, &roll_f, &yaw_f);
+    quatToEuler(q_1[0], q_1[1], q_1[2], q_1[3], &pitch_f_2, &roll_f_2, &yaw_f_2);
+    
+    if(once <= 1){
+        once = true ; 
+        roll_init  = roll_f  ;
+        pitch_init = pitch_f ;  
+        once++ ; 
+    }
+    roll_f  -= roll_init; 
+    pitch_f -= pitch_init;
+    
+    temp_pitch = pitch_f*(180/PI);
+    if(temp_pitch<0){
+      temp_roll = roll_f*(180/PI) - (temp_pitch/10);
+    }else{ temp_roll = roll_f*(180/PI); } 
+    
+    if(temp_pitch>0){
+      temp_yaw = yaw_f_2*(180/PI) - (temp_pitch/10); 
+      temp_roll = roll_f*(180/PI) - (temp_pitch/10);
+    }else{ temp_yaw = yaw_f_2*(180/PI); }
+    if(temp_roll > 0){
+      temp_pitch = pitch_f*(180/PI) + (temp_roll/10) ;
+      temp_yaw =  yaw_f_2*(180/PI) + (temp_roll/10);
+    }
+    if(temp_roll < 0 ){temp_yaw =  yaw_f_2*(180/PI) + (temp_roll/10);}
+
+    temp_rg = roll_f_2*(180/PI);
+    temp_pg = pitch_f_2*(180/PI);
+    temp_yg = yaw_f*(180/PI);
+
+    roll_f = temp_roll*(PI/180); 
+    pitch_f = temp_pitch*(PI/180); 
+    yaw_f_2 = temp_yaw*(PI/180);
+
+    roll_f_2 = temp_rg*(PI/180); 
+    pitch_f_2 = temp_pg*(PI/180);
+    yaw_f = temp_yg*(PI/180);
+
+    // Update Setpoints from RC
+    roll_ref  = -rc.roll  * MAX_ANGLE_RAD;
+    pitch_ref = -rc.pitch * MAX_ANGLE_RAD; // <--- FIXED: Pitch is inverted so pushing UP flies FORWARD
+
+    // Calculate Roll and Pitch outer loops
+    roll_rate_ref  = pid_calc(roll_ref  - roll_f, roll_f, wy_f , dt2, kp_roll,  ki_roll,  kd_roll,  &pid_roll);
+    pitch_rate_ref = pid_calc(pitch_ref - pitch_f, pitch_f, -wx_f , dt2, kp_pitch, ki_pitch, kd_pitch, &pid_pitch);
+
+    // Yaw Logic: Direct Rate vs Heading Hold
+    if (fabsf(rc.yaw) > 0.05f) {
+      // 1. Stick is moving: Send rate directly, bypass outer PID
+      yaw_rate_ref = -rc.yaw * MAX_YAW_RATE;
+      // Keep updating the target heading so it locks onto this new angle when you let go
+      yaw_ref = yaw_f_2; 
+    } else {
+      // 2. Stick is centered: Use outer PID to hold the current heading
+      yaw_rate_ref = pid_calc(yaw_ref - yaw_f_2, yaw_f_2, wz_f, dt2, kp_yaw, ki_yaw, kd_yaw, &pid_yaw);
+    }
+
+    // Clamp rate refs
+    roll_rate_ref  = constrain(roll_rate_ref,  -1.5f, 1.5f);  // ~85 deg/s max
+    pitch_rate_ref = constrain(pitch_rate_ref, -1.5f, 1.5f);
+    yaw_rate_ref   = constrain(yaw_rate_ref,   -1.0f, 1.0f);
+ 
+    print_telemetry(roll_f, pitch_f,yaw_f_2, m0,m1, m2, m3);
+  }
+} 
