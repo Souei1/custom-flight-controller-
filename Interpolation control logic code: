@@ -1,0 +1,1179 @@
+#include <Wire.h> 
+#include <Servo.h> 
+#include <math.h> 
+
+#define I2C_Freq 400000 
+#define L 0.22 
+#define pwm_coeff 0.4 
+#define mg 1.2 
+#define v_ref 12 
+
+const int ADDR_MPU = 0x68 ; 
+const int ADDR_MAG = 0x0D ; 
+Servo esc1,esc2,esc3,esc4 ; 
+int value1 ; 
+const int bias_sample_count = 500 ; 
+
+// ---madgwick quatrenion state 
+float q[4] = {1.0f,0.0f,0.0f,0.0f} ;
+float beta = 0.0001f ;
+bool calibrated = false ; 
+
+// --- madgwick angle outputs 
+float roll_f = 0.0f ; 
+float pitch_f = 0.0f ; 
+float yaw_f = 0.0f ; 
+int pitch = 0 ; 
+int roll = 0 ; 
+int yaw = 0 ; 
+
+// --- angle offset 
+bool angle_once = false ; 
+float roll_init = 0.0f ; 
+float pitch_init = 0.0f ; 
+float yaw_init = 0.0f ; 
+
+//---   Imu varaibles 
+const float ACCEL_SENS = 4096.0f;    // LSB / g for +/-8g
+const float G_TO_MS2 = 9.80665f;
+const float GYRO_SENS = 16.4f;       // LSB / (deg/s) for +/-2000 dps
+const float DEG2RAD = (PI / 180.0f); 
+// calibration 
+float accel_x_bias = 0.0f, accel_y_bias = 0.0f, accel_z_bias = 0.0f;
+float gyro_x_bias = 0.0f, gyro_y_bias = 0.0f, gyro_z_bias = 0.0f; 
+
+float ax = 0.0f , ay = 0.0f , az = 0.0f ; 
+float wx = 0.0f , wy = 0.0f , wz = 0.0f ; 
+float wx_f = 0.0f , wy_f = 0.0f , wz_f = 0.0f ; 
+
+//--- MAG Variables 
+float mx = 0.0f, my = 0.0f , mz = 0.0f ;
+float mag_x_bias = 0.0f;
+float mag_y_bias = 0.0f;
+float mag_z_bias = 0.0f; 
+float mag_x_scale = 1.0f; // 1.0 = no correction soft iron scale factors 
+float mag_y_scale = 1.0f;
+float mag_z_scale = 1.0f;
+
+//--- gyro lps 
+float gx_prev = 0.0f , gy_prev = 0.0f , gz_prev = 0.0f ; 
+const float gyro_alpha = 0.9f ; 
+
+//--- timing method 
+const unsigned long LOOP_PERIOD_US_RATE = 1000 ; 
+const unsigned long LOOP_PERIOD_US = 10000 ; 
+
+unsigned long prevLoopTime_rate = 0; 
+unsigned long prevLoopTime = 0 ; 
+
+float dt1 = 0.0f ; 
+float dt2 = 0.0f ; 
+//---flags
+bool flag1 = false ; 
+bool flag2 = false ; 
+bool flag3 = false ; 
+
+//---  rate pid state  
+struct PIDSTATE_RATE{
+  float prev_error;
+  float integral; 
+  float d_f;
+} ;
+PIDSTATE_RATE pid_roll_rate = {0.0f,0.0f,0.0f} ; 
+PIDSTATE_RATE pid_pitch_rate = {0.0f,0.0f,0.0f} ; 
+PIDSTATE_RATE pid_yaw_rate = {0.0f,0.0f,0.0f};
+
+//-- angle pid state 
+struct PIDSTATE_ANGLE {
+  float prev_error ; 
+  float i ; 
+}; 
+PIDSTATE_ANGLE pid_roll = {0.0f,0.0f}; 
+PIDSTATE_ANGLE pid_pitch = {0.0f,0.0f}; 
+PIDSTATE_ANGLE pid_yaw = {0.0f,0.0f};
+
+//--- Angle controller refrence 
+float roll_rate_ref = 0.0f ; 
+float roll_ref = (0.0) *(PI/180.0f) ; //desr roll angle in red 
+float pitch_rate_ref = 0.0f ; 
+float pitch_ref = (0.0) *(PI/180.0f) ;
+float yaw_rate_ref = 0.0f ;
+float yaw_ref = (0.0) *(PI/180.0f) ;
+
+//--- PID Values for roll angle (outer loop)
+float kp_roll = 2.5f ; 
+float kd_roll = 0.09f ; 
+float ki_roll = 0.9f ; 
+//---PID Values for pitch angle 
+float kp_pitch = 2.3f ; 
+float kd_pitch = 0.3f ;
+float ki_pitch = 0.7f ; 
+//---PID Values for yaw angle
+float kp_yaw = 3.5f; 
+float kd_yaw = 0.5f;
+float ki_yaw = 0.6f;
+
+//--- PID values for roll_rate (inner loop) 
+float kp = 0.5f ; 
+float kd = 0.01f ;
+float ki = 0.0096f ; 
+//--- PID values for pitch_rate 
+float kp_pitch_rate = 2.0f ;
+float kd_pitch_rate = 0.05 ; 
+float ki_pitch_rate = 0.02f ; 
+//--- PID values for Yaw_rate 
+float kp_yaw_rate = 2.5f ;
+float kd_yaw_rate = 0.2f ;
+float ki_yaw_rate = 0.02f ;
+
+//--- INNER PID CONST
+float roll_torque = 0.0f ;  
+float pitch_torque = 0.0f ; 
+float yaw_torque = 0.0f;
+float yaw_error ;
+float roll_error ; 
+float pitch_error ; 
+float diff = 0.0f ;
+bool automatic_turn_off = false ; 
+//--- LPF for d_term (Inner_loop) 
+float dTerm_f = 0.0f ; 
+const float d_alpha = 0.90f ; 
+// motors 
+double F1, F2, F3 ,F4 ;  
+int pwm1 ; //hermit interpolaton equation
+int pwm2 ; 
+int pwm3 ; 
+int pwm4 ;
+
+//--- battery variables  
+int analogInput = 19;
+float vout = 0.0;
+float vin = 11.74;
+float R1 = 30000.0; 
+float R2 = 7500.0; 
+int value = 0 ; 
+float factor = 2.08 / 11.65 ; 
+float vin_f  = 0.0 ; 
+float vin_prev = 11.5;
+bool Serial_once = true ; 
+
+//--- helper functions 
+void normalizeVec3(float &x, float &y, float &z) {
+  float n = sqrtf(x*x + y*y + z*z);
+  if (n > 1e-8f) {
+    x /= n; y /= n; z /= n;
+  } else {
+    // fallback to avoid division by zero: point Z-up
+    x = 0.0f; y = 0.0f; z = 1.0f;
+  }
+} 
+//--- sensor setup 
+void setupMPU6050() {
+  Wire1.begin();
+  // wake up
+  Wire1.beginTransmission(ADDR_MPU);
+  Wire1.write(0x6B); Wire1.write(0x00); Wire1.endTransmission(); // wake
+  // accel ±8g -> AFS_SEL = 2 -> 0x10 on ACCEL_CONFIG
+  Wire1.beginTransmission(ADDR_MPU);
+  Wire1.write(0x1C); Wire1.write(0x10); Wire1.endTransmission();
+  // gyro ±2000 dps -> FS_SEL = 3 -> 0x18 on GYRO_CONFIG
+  Wire1.beginTransmission(ADDR_MPU);
+  Wire1.write(0x1B); Wire1.write(0x18); Wire1.endTransmission();
+} 
+void setupQMC5883L() {
+  // Soft reset
+  Wire1.beginTransmission(ADDR_MAG);
+  Wire1.write(0x0B); Wire1.write(0x01);
+  Wire1.endTransmission();
+  delay(10);
+  Wire1.beginTransmission(ADDR_MAG);
+  Wire1.write(0x09); Wire1.write(0x1D);
+  Wire1.endTransmission();
+  delay(10);
+}
+
+//--- read functions  
+// Returns: true when read succeeded, false on timeout/short read
+// Outputs:
+//  ax,ay,az => accel in m/s^2 (bias-subtracted if accel_x_bias set)
+//  wx,wy,wz => gyro in rad/s (bias-subtracted if gyro_*_bias set)
+bool readMPU(float &ax, float &ay, float &az, float &wx, float &wy, float &wz) {
+  Wire1.beginTransmission(ADDR_MPU);
+  Wire1.write(0x3B); // starting register for accel
+  Wire1.endTransmission(false);
+  uint8_t count = Wire1.requestFrom((uint8_t)ADDR_MPU, (uint8_t)14);
+  if (count < 14) return false;
+
+  int16_t rawAx = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawAy = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawAz = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawTemp = (int16_t)(Wire1.read() << 8 | Wire1.read()); (void)rawTemp;
+  int16_t rawGx = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawGy = (int16_t)(Wire1.read() << 8 | Wire1.read());
+  int16_t rawGz = (int16_t)(Wire1.read() << 8 | Wire1.read());
+
+  // scale accel: raw / (LSB per g) -> g -> *9.80665 -> m/s^2
+  ax = ( (float)rawAx / ACCEL_SENS ) * G_TO_MS2;
+  ay = ( (float)rawAy / ACCEL_SENS ) * G_TO_MS2;
+  az = ( (float)rawAz / ACCEL_SENS ) * G_TO_MS2;
+  
+  // subtract any precomputed bias (in same units)
+  ax -= accel_x_bias;
+  ay -= accel_y_bias;
+  az -= accel_z_bias;
+
+  // scale gyro: raw / LSB -> deg/s -> *DEG2RAD -> rad/s
+  wx = ( (float) rawGx / GYRO_SENS ) * DEG2RAD;
+  wy = ( (float) rawGy / GYRO_SENS ) * DEG2RAD;
+  wz = ( (float) rawGz / GYRO_SENS ) * DEG2RAD;
+
+  wx -= gyro_x_bias;
+  wy -= gyro_y_bias;
+  wz -= gyro_z_bias;
+   
+  return true;
+} 
+bool readQMC5883L(float &mx, float &my, float &mz) {
+  
+  Wire1.beginTransmission(ADDR_MAG);
+  Wire1.write(0x06);
+  Wire1.endTransmission(false);
+  Wire1.requestFrom((uint8_t)ADDR_MAG, (uint8_t)1);
+  if (!Wire1.available()) return false;
+  uint8_t status = Wire1.read();
+  if (!(status & 0x01)) return false; 
+
+  Wire1.beginTransmission(ADDR_MAG);
+  Wire1.write(0x00); 
+  Wire1.endTransmission(false);
+  uint8_t count = Wire1.requestFrom((uint8_t)ADDR_MAG, (uint8_t)6);
+  if (count < 6) return false;
+
+  int16_t rawMx = (int16_t)(Wire1.read() | Wire1.read() << 8); // little-endian
+  int16_t rawMy = (int16_t)(Wire1.read() | Wire1.read() << 8);
+  int16_t rawMz = (int16_t)(Wire1.read() | Wire1.read() << 8);
+
+  // Apply hard-iron + soft-iron correction
+  mx = ((float)rawMx - mag_x_bias) * mag_x_scale;
+  my = ((float)rawMy - mag_y_bias) * mag_y_scale;
+  mz = ((float)rawMz - mag_z_bias) * mag_z_scale;
+
+  return true;
+}
+
+//--- gyro bias 
+void calibrateGyro(int samples=500, int delayMs=5) {
+  long gx_sum=0, gy_sum=0, gz_sum=0;
+  for (int i=0;i<samples;i++){
+    float ax,ay,az, gx,gy,gz;
+    if (!readMPU(ax,ay,az,gx,gy,gz)) { delay(5); --i; continue; }
+    gx_sum += (long)(gx * 1e6f); // scale to preserve precision
+    gy_sum += (long)(gy * 1e6f);
+    gz_sum += (long)(gz * 1e6f);
+    delay(delayMs);
+  }
+  gyro_x_bias = (float)gx_sum / (samples * 1e6f);
+  gyro_y_bias = (float)gy_sum / (samples * 1e6f);
+  gyro_z_bias = (float)gz_sum / (samples * 1e6f);
+
+  Serial.print("Gyro biases (rad/s): ");
+  Serial.print(gyro_x_bias,6); Serial.print(", ");
+  Serial.print(gyro_y_bias,6); Serial.print(", ");
+  Serial.println(gyro_z_bias,6);
+}
+
+//--- inner loop pid function 
+float pid(float error, float dt, float kp, float ki,float kd,float *diff,PIDSTATE_RATE *state) {
+  // prevent division by zero or very small dt
+  if (dt <= 0.001f) {
+    dt = 0.001f;
+  }
+  float derivative = (error - state->prev_error) / dt;
+  state->d_f = (d_alpha * state->d_f) + ((1.0f - d_alpha) * derivative);
+  // store raw derivative for Serial print/debug if needed
+  *diff = derivative;
+  // integral with anti-windup clamp
+  state->integral += error * dt;
+  state->integral = constrain(state->integral, -0.5f, 0.5f);
+  // PID output = torque
+  float output = kp * error + ki * state->integral + kd * state->d_f;
+  state->prev_error = error;
+  return output;
+} 
+//--- outer loop (angle control ) 
+float pid_calc(float error, float angle, float rate, float dt,float kp, float ki, float kd, PIDSTATE_ANGLE *state){
+  
+  // integral only when angle error is reasonable
+  if (fabsf(error) < 15.0f) {
+    state->i += error * dt;
+    state->i = constrain(state->i, -20.0f, 20.0f);
+  }
+  // derivative term uses gyro rate directly
+  float d = rate;
+  state->prev_error = error;
+  // output is desired roll rate
+  return kp * error + ki * state->i - kd * d;
+}
+//---inverse square root 
+float invSqrt(float x) {
+  float halfx = 0.5f * x;
+  float y = x;
+  long i = *(long*)&y;
+  i = 0x5f3759df - (i>>1);
+  y = *(float*)&i;
+  y = y * (1.5f - (halfx * y * y));
+  return y;
+} 
+//---Madgwick filter 
+//--gradiant decent 
+// Madgwick 9-axis gradient descent step
+void MadgwickAHRSupdate(float gx, float gy, float gz,
+                        float ax, float ay, float az,
+                        float mx_in, float my_in, float mz_in,
+                        float dt) {
+
+  float recipNorm;
+  float s0, s1, s2, s3;
+  float qDot1, qDot2, qDot3, qDot4;
+  float hx, hy;
+  float _2q0mx, _2q0my, _2q0mz, _2q1mx;
+  float _2bx, _2bz, _4bx, _4bz;
+  float _2q0, _2q1, _2q2, _2q3;
+  float _2q0q2, _2q2q3;
+  float q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
+
+  float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+
+  // Use 6-axis fallback if magnetometer data is zero/invalid
+  bool mag_valid = !((mx_in == 0.0f) && (my_in == 0.0f) && (mz_in == 0.0f));
+
+  // Rate of change of quaternion from gyroscope
+  qDot1 = 0.5f * (-q1*gx - q2*gy - q3*gz);
+  qDot2 = 0.5f * ( q0*gx + q2*gz - q3*gy);
+  qDot3 = 0.5f * ( q0*gy - q1*gz + q3*gx);
+  qDot4 = 0.5f * ( q0*gz + q1*gy - q2*gx);
+
+  if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
+
+    // Normalize accel
+    recipNorm = invSqrt(ax*ax + ay*ay + az*az);
+    ax *= recipNorm; ay *= recipNorm; az *= recipNorm;
+
+    if (mag_valid) {
+      // Normalize mag
+      recipNorm = invSqrt(mx_in*mx_in + my_in*my_in + mz_in*mz_in);
+      mx_in *= recipNorm; my_in *= recipNorm; mz_in *= recipNorm;
+
+      // Auxiliary variables
+      _2q0mx = 2.0f * q0 * mx_in;
+      _2q0my = 2.0f * q0 * my_in;
+      _2q0mz = 2.0f * q0 * mz_in;
+      _2q1mx = 2.0f * q1 * mx_in;
+      _2q0   = 2.0f * q0;
+      _2q1   = 2.0f * q1;
+      _2q2   = 2.0f * q2;
+      _2q3   = 2.0f * q3;
+      q0q0   = q0*q0; q0q1 = q0*q1; q0q2 = q0*q2; q0q3 = q0*q3;
+      q1q1   = q1*q1; q1q2 = q1*q2; q1q3 = q1*q3;
+      q2q2   = q2*q2; q2q3 = q2*q3; q3q3 = q3*q3;
+
+      // Reference direction of Earth's magnetic field
+      hx = mx_in*(q0q0 + q1q1 - q2q2 - q3q3)
+         + 2.0f*my_in*(q1q2 - q0q3)
+         + 2.0f*mz_in*(q1q3 + q0q2);
+      hy = 2.0f*mx_in*(q1q2 + q0q3)
+         + my_in*(q0q0 - q1q1 + q2q2 - q3q3)
+         + 2.0f*mz_in*(q2q3 - q0q1);
+      _2bx = sqrtf(hx*hx + hy*hy);
+      _2bz = -2.0f*mx_in*(q1q3 - q0q2)
+             + 2.0f*my_in*(q2q3 + q0q1)
+             + mz_in*(q0q0 - q1q1 - q2q2 + q3q3);
+      _4bx = 2.0f * _2bx;
+      _4bz = 2.0f * _2bz;
+
+      // Gradient descent — 9-axis step
+      s0 = -_2q2*(2.0f*(q1q3 - q0q2) - ax)
+          + _2q1*(2.0f*(q0q1 + q2q3) - ay)
+          - _2bz*q2*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0q2) - mx_in)
+          + (-_2bx*q3 + _2bz*q1)*(_2bx*(q1q2 - q0q3) + _2bz*(q0q1 + q2q3) - my_in)
+          + _2bx*q2*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz_in);
+
+      s1 = _2q3*(2.0f*(q1q3 - q0q2) - ax)
+         + _2q0*(2.0f*(q0q1 + q2q3) - ay)
+         - 4.0f*q1*(1.0f - 2.0f*(q1q1 + q2q2) - az)  // ← az term added
+         + _2bz*q3*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0q2) - mx_in)
+         + (_2bx*q2 + _2bz*q0)*(_2bx*(q1q2 - q0q3) + _2bz*(q0q1 + q2q3) - my_in)
+         + (_2bx*q3 - _4bz*q1)*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz_in);
+
+      s2 = -_2q0*(2.0f*(q1q3 - q0q2) - ax)
+         + _2q3*(2.0f*(q0q1 + q2q3) - ay)
+         - 4.0f*q2*(1.0f - 2.0f*(q1q1 + q2q2) - az)
+         + (-_4bx*q2 - _2bz*q0)*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0q2) - mx_in)
+         + (_2bx*q1 + _2bz*q3)*(_2bx*(q1q2 - q0q3) + _2bz*(q0q1 + q2q3) - my_in)
+         + (_2bx*q0 - _4bz*q2)*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz_in);
+
+      s3 = _2q1*(2.0f*(q1q3 - q0q2) - ax)
+         + _2q2*(2.0f*(q0q1 + q2q3) - ay)
+         + (-_4bx*q3 + _2bz*q1)*(_2bx*(0.5f - q2q2 - q3q3) + _2bz*(q1q3 - q0q2) - mx_in)
+         + (-_2bx*q0 + _2bz*q2)*(_2bx*(q1q2 - q0q3) + _2bz*(q0q1 + q2q3) - my_in)
+         + _2bx*q1*(_2bx*(q0q2 + q1q3) + _2bz*(0.5f - q1q1 - q2q2) - mz_in);
+
+    } else {
+      // 6-axis fallback (same as your original)
+      float _4q0 = 4.0f*q0, _4q1 = 4.0f*q1, _4q2 = 4.0f*q2;
+      float _8q1 = 8.0f*q1, _8q2 = 8.0f*q2;
+      _2q0 = 2.0f*q0; _2q1 = 2.0f*q1; _2q2 = 2.0f*q2; _2q3 = 2.0f*q3;
+      q0q0 = q0*q0; q1q1 = q1*q1; q2q2 = q2*q2; q3q3 = q3*q3;
+
+      s0 = _4q0*q2q2 + _2q2*ax + _4q0*q1q1 - _2q1*ay;
+      s1 = _4q1*q3q3 - _2q3*ax + 4.0f*q0q0*q1 - _2q0*ay - _4q1 + _8q1*q1q1 + _8q1*q2q2 + _4q1*az;
+      s2 = 4.0f*q0q0*q2 + _2q0*ax + _4q2*q3q3 - _2q3*ay - _4q2 + _8q2*q1q1 + _8q2*q2q2 + _4q2*az;
+      s3 = 4.0f*q1q1*q3 - _2q1*ax + 4.0f*q2q2*q3 - _2q2*ay;
+    }
+
+    // Normalize gradient
+    recipNorm = invSqrt(s0*s0 + s1*s1 + s2*s2 + s3*s3);
+    s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+
+    qDot1 -= beta * s0;
+    qDot2 -= beta * s1;
+    qDot3 -= beta * s2;
+    qDot4 -= beta * s3;
+  }
+
+  // Integrate
+  q0 += qDot1 * dt;
+  q1 += qDot2 * dt;
+  q2 += qDot3 * dt;
+  q3 += qDot4 * dt;
+
+  recipNorm = invSqrt(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+  q[0] = q0 * recipNorm;
+  q[1] = q1 * recipNorm;
+  q[2] = q2 * recipNorm;
+  q[3] = q3 * recipNorm;
+}
+
+//--- convert from q to euler 
+void quatToFusedAngles(float q0, float q1, float q2, float q3,
+                       float *fused_yaw, float *fused_roll, float *fused_pitch)
+{
+    // ---------- Fused Yaw ----------
+    *fused_yaw = atan2f(
+        2.0f * (q0*q3 + q1*q2),
+        1.0f - 2.0f * (q2*q2 + q3*q3)
+    );
+
+    // ---------- Fused Pitch ----------
+    float sp = 2.0f * (q0*q2 - q1*q3);
+    if (sp > 1) sp = 1;
+    if (sp < -1) sp = -1;
+    *fused_pitch = asinf(sp);
+
+    // ---------- Fused Roll ----------
+    float sr = 2.0f * (q0*q1 + q2*q3);
+    if (sr > 1) sr = 1;
+    if (sr < -1) sr = -1;
+    *fused_roll = asinf(sr);
+
+    // ---------- Hemisphere ----------
+    float h = q0*q0 + q3*q3 - (q1*q1 + q2*q2);
+
+    if (h < 0) {
+        *fused_pitch = copysignf(M_PI - fabsf(*fused_pitch), *fused_pitch);
+        *fused_roll  = copysignf(M_PI - fabsf(*fused_roll),  *fused_roll );
+    }
+    
+    yaw = *fused_yaw *180.0f / PI;
+    roll = *fused_pitch* 180.0f / PI;
+    pitch = *fused_roll * 180.0f / PI;
+    if(roll>=175 ){
+      roll = roll-175 ; 
+    }else if(roll<=-175){
+      roll = roll+175 ; 
+    }
+    if(pitch>=175 ){
+      pitch = pitch-175 ; 
+    }else if(pitch<=-175){
+      pitch = pitch+175 ; 
+    }
+} 
+
+double cubicInterp_C1(double T) {
+
+  double PWM3 = 0.0;
+
+  // c_1
+  if( T <= 0.5){
+    PWM3 =  200*T+ 1000;
+
+  }else if (0.5 <=  T && T < 0.63){
+    PWM3 = 153.846*T + 1023.076;
+
+  }else if (0.63 <=  T && T < 0.75){
+    PWM3 = 166.667*T + 1015;
+
+  }else if (0.75 <=  T && T< 0.9){
+    PWM3 = 133.333*T + 1040;
+
+  }else if (0.9 <=  T && T < 1.02){
+    PWM3 = 166.667*T + 1010;
+
+  }else if (1.02 <=  T && T< 1.157){
+    PWM3 = 145.985*T + 1031.094;
+
+  }else if (1.157 <=  T && T< 1.27){
+    PWM3 = 176.991*T + 995.221;
+
+  }else if (1.27 <=  T  && T< 1.41){
+    PWM3 = 142.857*T + 1038.571;
+
+  }else if (1.41 <=  T && T< 1.55){
+    PWM3 = 142.857*T + 1038.571;
+
+  }else if (1.55 <=  T && T< 1.7){
+    PWM3 = 133.333*T + 1053.333;
+
+  }else if (1.7 <=  T && T< 1.878){
+    PWM3 = 112.360*T + 1088.988;
+
+  }else if (1.878 <=  T && T< 2.0){
+    PWM3 = 163.934*T + 992.131;
+
+  }else if (2.0 <=  T && T < 2.15){
+    PWM3 = 133.333*T + 1053.333;
+
+  }else if (2.15 <=  T && T < 2.3){
+    PWM3 = 133.333*T + 1053.333;
+
+  }else if (2.3 <=  T && T< 2.45){
+    PWM3 = 133.333*T + 1053.333;
+
+  }else if (2.45 <= T && T< 2.67){
+    PWM3 = 90.909*T + 1157.273;
+
+  }else if (2.67 <=  T && T< 2.8){
+    PWM3 = 153.846*T + 989.231;
+
+  }else if (2.8 <=  T &&  T< 2.98){
+    PWM3 = 111.111*T + 1108.889;
+
+  }else if (2.98 <=  T &&  T< 3.2){
+    PWM3 = 90.909*T + 1169.091;
+
+  }else if (3.2 <= T && T< 3.39){
+    PWM3 = 105.263*T + 1123.158;
+
+  }else if (3.39 <=  T && T< 3.6){
+    PWM3 = 95.238*T + 1157.143;
+
+  }else if (3.6 <=  T && T< 3.8){
+    PWM3 = 100.0*T + 1140.0;
+
+  }else if (3.8 <=  T &&  T< 4.0){
+    PWM3 = 100.0*T + 1140.0;
+
+  }else if (4.0 <=  T && T< 4.2){
+    PWM3 = 100.0*T + 1140.0;
+
+  }else if (4.2 <=  T &&  T< 4.44){
+    PWM3 = 83.333*T + 1210.0;
+
+  }else if (4.44 <=  T &&   T< 4.8){
+    PWM3 = 55.556*T + 1333.333;
+
+  }else if (4.8 <=  T && T< 4.95){
+    PWM3 = 133.333*T + 960.0;
+
+  }else if (4.95 <=  T && T< 5.17){
+    PWM3 = 90.909*T + 1170.0;
+
+  }else if (5.17 <=  T &&  T< 5.38){
+    PWM3 = 95.238*T + 1147.619;
+
+  }else if (5.38 <= T &&   T< 5.9){
+    PWM3 = 38.462*T + 1453.077;
+
+  }else if (5.9 <=  T && T< 6.34){
+    PWM3 = 45.455*T + 1411.818;
+
+  }else if (6.34 <=  T && T< 6.5){
+    PWM3 = 125.0*T + 907.5;
+
+  }else if (6.5 <=  T &&  T< 6.74){
+    PWM3 = 83.333*T + 1178.333;
+
+  }else if (6.74 <=  T && T< 6.95){
+    PWM3 = 95.238*T + 1098.095;
+
+  }else if (6.95 <=  T && T< 7.17){
+    PWM3 = 90.909*T + 1128.182;
+
+  }else if (7.17 <=  T && T<= 7.5){
+    PWM3 = 60.606*T + 1345.455;
+  } 
+  else {
+    PWM3 = NAN;
+  }
+  return PWM3 ;
+} 
+double cubicInterp_C2(double T) {
+  double PWM1 = 0.0;
+
+  //C_2
+  if( T <= 0.478){
+    PWM1 =  209*T+ 1000;
+
+  } else if (0.478 <=  T && T < 0.61){
+    PWM1 = 151.515*T + 1027.576;
+
+  }else if (0.61 <=  T && T < 0.722){
+    PWM1 = 178.571*T + 1011.071;
+
+  }else if (0.722 <=  T && T < 0.8545){
+    PWM1 = 150.943*T + 1031.019;
+
+  }else if (0.8545 <=  T && T < 0.976){
+    PWM1 = 164.609*T + 1019.342;
+
+  }else if (0.976 <=  T && T < 1.125){
+    PWM1 = 134.228*T + 1048.993;
+
+  }else if (1.125 <=  T && T < 1.258){
+    PWM1 = 150.376*T + 1030.827;
+
+  }else if (1.258 <=  T && T < 1.41){
+    PWM1 = 131.579*T + 1054.474;
+
+  }else if (1.41 <= T && T < 1.551){
+    PWM1 = 141.844*T + 1040.0;
+
+  }else if (1.551 <=  T && T < 1.684){
+    PWM1 = 150.376*T + 1026.767;
+
+  }else if (1.684 <=  T && T < 1.818){
+    PWM1 = 149.25*T + 1028.663;
+
+  }else if (1.818 <=  T && T < 1.978){
+    PWM1 = 125* T + 1072.75 ;
+
+  }else if (1.978 <=  T && T < 2.112){
+    PWM1 = 149.254*T + 1024.776;
+
+  }else if (2.112 <=  T && T < 2.255){
+    PWM1 = 139.860*T + 1044.615;
+
+  }else if (2.255 <= T && T < 2.417){
+    PWM1 = 123.457*T + 1081.605;
+
+  }else if (2.417 <=  T && T < 2.658){
+    PWM1 = 82.988*T + 1179.419;
+
+  }else if (2.658 <=  T && T < 2.801){
+    PWM1 = 139.860*T + 1028.252;
+
+  }else if (2.801 <=  T && T < 2.963){
+    PWM1 = 123.457*T + 1074.198;
+
+  }else if (2.963 <= T && T < 3.127){
+    PWM1 = 121.951*T + 1078.659;
+
+  }else if (3.127 <=  T && T < 3.298){
+    PWM1 = 116.959*T + 1094.269;
+
+  }else if (3.298 <=  T && T < 3.5){
+    PWM1 = 99.091*T + 1153.465;
+
+  }else if (3.5 <=  T && T < 3.673){
+    PWM1 = 115.607*T + 1095.376;
+
+  }else if (3.673 <= T && T < 3.855){
+    PWM1 = 109.891*T + 1116.374;
+
+  }else if (3.855 <=  T && T < 4.039){
+    PWM1 = 108.696*T + 1120.978;
+
+  }else if (4.039 <=  T && T < 4.308){
+    PWM1 = 74.349*T + 1259.703;
+
+  }else if (4.308 <=  T && T < 4.706){
+    PWM1 = 50.251*T + 1363.518;
+
+  }else if (4.706 <=  T && T < 4.921){
+    PWM1 = 93.023*T + 1162.323;
+
+  }else if (4.921 <=  T && T < 5.067){
+    PWM1 = 136.986*T + 945.890;
+
+  }else if (5.067 <=  T && T < 5.281){
+    PWM1 = 93.458*T + 1166.449;
+
+  }else if (5.281 <=  T && T < 5.788){
+    PWM1 = 39.448*T + 1451.677;
+
+  }else if (5.788 <=  T && T < 6.19){
+    PWM1 = 49.751*T + 1392.040;
+
+  }else if (6.19 <= T && T < 6.387){
+    PWM1 = 101.523*T + 1071.574;
+
+  }else if (6.387 <=  T && T < 6.623){
+    PWM1 = 84.746*T + 1178.729;
+
+  }else if (6.623 <= T && T < 6.78){
+    PWM1 = 127.389*T + 896.306;
+
+  }else if (6.78 <=  T && T < 6.927){
+    PWM1 = 136.054*T + 837.551;
+
+  }else if (6.927 <=  T && T <= 7.12){
+    PWM1 = 103.627*T + 1062.176;
+  }
+  else {
+    
+    PWM1 = NAN;
+  }
+
+  return PWM1;
+}
+double cubicInterp_CC1(double T) {
+  double PWM4 = 0.0;
+
+  //CC_1 
+  if( T <= 0.51){
+    PWM4 =  196*T+ 1000;
+
+  }else if (0.51 <=  T &&  T < 0.626){
+    PWM4 = 172.414*T + 1012.069;
+
+  }else if (0.626 <=  T &&  T < 0.76){
+    PWM4 = 149.254*T + 1026.567;
+
+  }else if (0.76 <=  T &&  T < 0.885){
+    PWM4 = 160.0*T + 1018.4;
+
+  }else if (0.885 <=  T &&  T < 1.0){
+    PWM4 = 173.913*T + 1006.087;
+
+  }else if (1.0 <=  T && T  < 1.138){
+    PWM4 = 144.928*T + 1035.073;
+
+  }else if (1.138 <=  T && T < 1.26){
+    PWM4 = 163.934*T + 1013.443;
+
+  }else if (1.26 <=  T && T < 1.4){
+    PWM4 = 142.857*T + 1040.0;
+
+  }else if (1.4 <=  T && T < 1.55){
+    PWM4 = 133.333*T + 1053.333;
+
+  }else if (1.55 <= T && T < 1.69){
+    PWM4 = 142.857*T + 1038.571;
+
+  }else if (1.69 <=  T && T < 1.87){
+    PWM4 = 111.111*T + 1092.222;
+
+  }else if (1.87 <=  T && T < 2.09){
+    PWM4 = 90.909*T + 1130.0;
+
+  }else if (2.09 <=  T && T < 2.16){
+    PWM4 = 285.714*T + 722.857;
+
+  }else if (2.16 <=  T && T < 2.39){
+    PWM4 = 86.957*T + 1152.174;
+
+  }else if (2.39 <=  T && T < 2.56){
+    PWM4 = 117.647*T + 1078.824;
+
+  }else if (2.56 <=  T && T < 2.65){
+    PWM4 = 222.222*T + 811.111;
+
+  }else if (2.65 <=  T && T < 2.84){
+    PWM4 = 105.263*T + 1121.053;
+
+  }else if (2.84 <=  T && T < 2.98){
+    PWM4 = 142.857*T + 1014.286;
+
+  }else if (2.98 <=  T && T < 3.14){
+    PWM4= 125.0*T + 1067.5;
+
+  }else if (3.14 <=  T && T < 3.32){
+    PWM4 = 111.111*T + 1111.111;
+
+  }else if (3.32 <=  T && T< 3.7){
+    PWM4 = 52.632*T + 1305.263;
+
+  }else if (3.7 <=  T && T < 3.95){
+    PWM4 = 80.0*T + 1204.0;
+
+  }else if (3.95 <=  T && T < 4.1){
+    PWM4 = 133.333*T + 993.333;
+
+  }else if (4.1 <=  T && T < 4.32){
+    PWM4 = 90.909*T + 1167.273;
+
+  }else if (4.32 <=  T && T < 4.55){
+    PWM4 = 86.957*T + 1184.348;
+
+  }else if (4.55 <=  T && T < 4.81){
+    PWM4 = 76.923*T + 1230.0;
+
+  }else if (4.81 <=  T && T < 5.0){
+    PWM4 = 105.263*T + 1093.684;
+
+  }else if (5.0 <=  T && T < 5.25){
+    PWM4 = 80.0*T + 1220.0;
+
+  }else if (5.25 <= T && T < 5.42){
+    PWM4 = 117.647*T + 1022.353;
+
+  }else if (5.42 <=  T && T < 6.0){
+    PWM4 = 34.483*T + 1473.103;
+
+  }else if (6.0 <=  T && T < 6.4){
+    PWM4 = 50.0*T + 1380.0;
+
+  }else if (6.4 <=  T && T < 6.5){
+    PWM4 = 200.0*T + 420.0;
+
+  }else if (6.5 <= T && T < 6.78){
+    PWM4 = 71.429*T + 1255.714;
+
+  }else if (6.78 <=  T && T < 7.0){
+    PWM4 = 90.909*T + 1123.636;
+
+  }else if (7.0 <=  T && T < 7.3){
+    PWM4 = 66.667*T + 1293.333;
+
+  }else if (7.3 <=  T && T <= 7.5){
+    PWM4 = 100.0*T + 1050.0;
+  }
+  else {
+    
+    PWM4 = NAN;
+  }
+
+  return PWM4;
+} 
+double cubicInterp_CC2(double T) {
+  double PWM2 = 0.0;
+
+  //CC_2
+  if( T <= 0.49){
+    PWM2 =  204*T+ 1000;
+
+  }else if (0.49 <=  T && T < 0.6){
+    PWM2 = 181.818*T + 1010.909;
+
+  }else if (0.6 <=  T && T < 0.7){
+    PWM2= 200.0*T + 1000.0;
+
+  }else if (0.7 <=  T && T < 0.83){
+    PWM2 = 153.846*T + 1032.308;
+
+  }else if (0.83 <=  T && T < 0.96){
+    PWM2 = 153.846*T + 1032.308;
+
+  }else if (0.96 <= T && T  < 1.0){
+    PWM2 = 500.0*T + 700.0;
+
+  }else if (1.0 <=  T && T < 1.25){
+    PWM2 = 80.0*T + 1120.0;
+
+  }else if (1.25 <=  T && T < 1.41){
+    PWM2 = 125.0*T + 1063.75;
+
+  }else if (1.41 <=  T && T < 1.57){
+    PWM2 = 125.0*T + 1063.75;
+
+  }else if (1.57 <= T && T < 1.7){
+    PWM2 = 153.846*T + 1018.462;
+
+  }else if (1.7 <=  T && T < 1.8){
+    PWM2 = 200.0*T + 940.0;
+
+  }else if (1.8 <=  T && T < 1.94){
+    PWM2 = 142.857*T + 1042.857;
+
+  }else if (1.94 <=  T && T < 2.0){
+    PWM2 = 333.333*T + 673.333;
+
+  }else if (2.0 <=  T && T < 2.2){
+    PWM2 = 100.0*T + 1140.0;
+
+  }else if (2.2 <= T && T < 2.3){
+    PWM2 = 200.0*T + 920.0;
+
+  }else if (2.3 <=  T && T < 2.52){
+    PWM2 = 90.909*T + 1170.909;
+
+  }else if (2.52 <= T && T < 2.68){
+    PWM2 = 125.0*T + 1085.0;
+
+  }else if (2.68 <=  T && T < 2.84){
+    PWM2 = 125.0*T + 1085.0;
+
+  }else if (2.84 <=  T && T < 3.0){
+    PWM2 = 125.0*T + 1085.0;
+
+  }else if (3.0 <= T && T < 3.15){
+    PWM2 = 133.333*T + 1060.0;
+
+  }else if (3.15 <= T && T < 3.38){
+    PWM2 = 86.957*T + 1206.087;
+
+  }else if (3.38 <=  T && T < 3.6){
+    PWM2 = 90.909*T + 1192.727;
+
+  }else if (3.6 <=  T && T < 3.8){
+    PWM2 = 100.0*T + 1160.0;
+
+  }else if (3.8 <=  T && T < 4.0){
+    PWM2 = 100.0*T + 1160.0;
+
+  }else if (4.0 <= T && T < 4.23){
+    PWM2 = 86.957*T + 1212.174;
+
+  }else if (4.23 <=  T && T < 4.5){
+    PWM2 = 74.074*T + 1266.667;
+
+  }else if (4.5 <=  T &&  T < 4.73){
+    PWM2 = 86.957*T + 1208.696;
+
+  }else if (4.73 <=  T && T< 4.97){
+    PWM2 = 83.333*T + 1225.833;
+
+  }else if (4.97 <=  T && T < 5.2){
+    PWM2 = 86.957*T + 1207.826;
+
+  }else if (5.2 <=  T && T < 5.6){
+    PWM2 = 50.0*T + 1400.0;
+
+  }else if (5.6 <= T && T < 6.0){
+    PWM2 = 50.0*T + 1400.0;
+
+  }else if (6.0 <=  T && T < 6.23){
+    PWM2 = 86.957*T + 1178.261;
+
+  }else if (6.23 <=  T && T < 6.4){
+    PWM2 = 117.647*T + 987.059;
+
+  }else if (6.4 <=  T && T < 6.67){
+    PWM2 = 74.074*T + 1265.926;
+
+  }else if (6.67 <= T && T < 6.8){
+    PWM2 = 153.846*T + 733.846;
+
+  }else if (6.8 <=  T && T <7.18){
+    PWM2 = 52.632*T + 1422.105;
+  }
+
+  else {
+    
+    PWM2 = NAN;
+  }
+
+    return PWM2;
+} 
+
+void setup(){ 
+  Serial.begin(115200); 
+  setupMPU6050();
+  setupQMC5883L(); 
+  Serial.println("Calibrating gyro... Keep IMU steady!");
+  delay(5);
+  calibrateGyro(500, 5);
+  Serial.println("Calibration complete.");
+  delay(100);
+   if (readMPU(ax, ay, az, wx, wy, wz)) {
+
+    float ax_m = ay;
+    float ay_m = ax;
+    float az_m = az;
+
+    normalizeVec3(ax_m, ay_m, az_m);
+
+    float roll0  = atan2f(ay_m, az_m);
+    float pitch0 = atan2f(-ax_m, sqrtf(ay_m * ay_m + az_m * az_m));
+
+    float cr = cosf(roll0 * 0.5f);
+    float sr = sinf(roll0 * 0.5f);
+    float cp = cosf(pitch0 * 0.5f);
+    float sp = sinf(pitch0 * 0.5f);
+
+    q[0] = cr * cp;
+    q[1] = sr * cp;
+    q[2] = cr * sp;
+    q[3] = -sr * sp;
+
+    float n = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+
+    if (n > 1e-8f) {
+      q[0] /= n;
+      q[1] /= n;
+      q[2] /= n;
+      q[3] /= n;
+    }
+  }
+  esc1.attach(23, 1000, 2000);   
+  esc1.writeMicroseconds(1000); 
+  esc2.attach(14, 1000, 2000);   
+  esc2.writeMicroseconds(1000); 
+  esc3.attach(9, 1000, 2000);   
+  esc3.writeMicroseconds(1000); 
+  esc4.attach(0, 1000, 2000);   
+  esc4.writeMicroseconds(1000); 
+  Serial.println("Ready.");
+  delay(10000); 
+  Serial.println("will start");
+  delay(5000);
+   prevLoopTime_rate = micros();
+  prevLoopTime = micros();
+} 
+void loop(){
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+   if (cmd == 'k' || cmd == 'K') {
+      esc1.writeMicroseconds(1000);
+      esc2.writeMicroseconds(1000);
+      esc3.writeMicroseconds(1000);
+      esc4.writeMicroseconds(1000);
+      flag3 = true; 
+      Serial.println("=== All motors stopped ===");
+    } 
+  }
+   unsigned long now = micros();
+
+  if (now - prevLoopTime_rate >= LOOP_PERIOD_US_RATE) {
+    flag1 = true;
+    dt1 = (now - prevLoopTime_rate) * 1e-6f;
+    prevLoopTime_rate = now;
+  }
+
+  if (now - prevLoopTime >= LOOP_PERIOD_US) {
+    flag2 = true;
+    dt2 = (now - prevLoopTime) * 1e-6f;
+    prevLoopTime = now;
+  }
+  //--- inner loop
+  if (flag1) {
+    flag1 = false;
+
+    bool ok1 = readMPU(ax, ay, az, wx, wy, wz);
+
+    if (!ok1) {
+      Serial.println("MPU read failed");
+      return;
+    }
+
+    // Gyro LPF
+    wx_f = gyro_alpha * gx_prev + (1.0f - gyro_alpha) * wx;
+    wy_f = gyro_alpha * gy_prev + (1.0f - gyro_alpha) * wy;
+    wz_f = gyro_alpha * gz_prev + (1.0f - gyro_alpha) * wz;
+
+    gx_prev = wx_f;
+    gy_prev = wy_f;
+    gz_prev = wz_f;
+
+    
+    if ((wy_f >= 5.0f || wy_f <= -5.0f) && flag3 == false) {
+      Serial.print("roll_rate limit hit: ");
+      Serial.println(wy_f);
+
+      esc1.writeMicroseconds(1000);
+      esc2.writeMicroseconds(1000);
+      esc3.writeMicroseconds(1000);
+      esc4.writeMicroseconds(1000);
+
+      flag3 = true;
+    }
+
+    if (flag3 == false) {
+
+      // roll rate error
+      roll_error = roll_rate_ref - wy_f;
+      pitch_error = pitch_rate_ref - wx_f ; 
+      yaw_error =  yaw_rate_ref - wz_f;
+      // inner PID output = torque
+      roll_torque = pid(roll_error, dt1, kp, ki, kd, &diff,&pid_roll_rate);
+      pitch_torque = pid(pitch_error, dt1, kp_pitch_rate, ki_pitch_rate, kd_pitch_rate, &diff,&pid_pitch_rate) ; 
+
+      float T = 6.0f;
+
+      vin = v_ref;
+
+      F1 = T / 4.0f + roll_torque + pitch_torque - yaw_torque;
+      F2 = T / 4.0f - roll_torque + pitch_torque + yaw_torque;
+      F3 = T / 4.0f - roll_torque - pitch_torque - yaw_torque;
+      F4 = T / 4.0f + roll_torque - pitch_torque + yaw_torque;
+
+      F1 = constrain(F1 * (v_ref / vin), 0, 7);
+      F2 = constrain(F2 * (v_ref / vin), 0, 7);
+      F3 = constrain(F3 * (v_ref / vin), 0, 7);
+      F4 = constrain(F4 * (v_ref / vin), 0, 7);
+
+      pwm1 = constrain(cubicInterp_C2(F1),  1050, 1300);
+      pwm2 = constrain(cubicInterp_CC2(F2), 1050, 1300);
+      pwm3 = constrain(cubicInterp_CC1(F3), 1050, 1300);
+      pwm4 = constrain(cubicInterp_C1(F4),  1050, 1300);
+
+      esc1.writeMicroseconds(pwm1);
+      esc2.writeMicroseconds(pwm2);
+      esc3.writeMicroseconds(pwm3);
+      esc4.writeMicroseconds(pwm4);
+    }
+  }
+   if (flag2) {
+    flag2 = false;
+
+    float ax_m = ay;
+    float ay_m = ax;
+    float az_m = az;
+
+    bool mag_ok = readQMC5883L(mx, my, mz);
+    if (!mag_ok) { mx = 0.0f; my = 0.0f; mz = 0.0f; } 
+   float mx_m = my;
+   float my_m = mx;
+   float mz_m = mz;
+
+    normalizeVec3(ax_m, ay_m, az_m);
+
+    MadgwickAHRSupdate(wx_f, wy_f, wz_f,
+                   ax_m, ay_m, az_m,
+                   mx_m, my_m, mz_m,
+                   dt2);
+
+    quatToFusedAngles(q[0], q[1], q[2], q[3],
+                      &yaw_f, &pitch_f, &roll_f);
+
+    if (angle_once == false) {
+      angle_once = true;
+      roll_init = roll_f;
+      pitch_init = pitch_f;
+      yaw_init = yaw_f;
+    }
+
+    roll_f -= roll_init;
+    pitch_f -= pitch_init;
+    yaw_f -= yaw_init;
+
+  
+    roll_rate_ref = pid_calc(roll_ref - roll_f,roll_f,wy_f,dt2,kp_roll,ki_roll,kd_roll,&pid_roll);
+    roll_rate_ref = constrain(roll_rate_ref, -1.5f, 1.5f); 
+    pitch_rate_ref = pid_calc(pitch_ref - pitch_f,pitch_f,wx_f,dt2,kp_pitch,ki_pitch,kd_pitch,&pid_pitch);
+    pitch_rate_ref = constrain(pitch_rate_ref, -1.5f, 1.5f); 
+    yaw_rate_ref = pid_calc(yaw_ref - yaw_f, yaw_f, wz_f, dt2, kp_yaw, ki_yaw, kd_yaw, &pid_yaw);
+    
+    Serial.print("roll_angle_deg: ");
+    Serial.print(roll_f * 180.0f / PI);
+    Serial.print("pitch_angle_deg:") ; 
+    Serial.print(pitch_f * 180.0f/PI) ;
+    Serial.print("yaw_angle_deg: ") ;
+    Serial.print(yaw_f * 180.0f/PI ) ; 
+    Serial.print("Wz_f: ") ;
+    Serial.print(wz_f) ; 
+    Serial.print("Ywa_rate_ref : "); 
+    Serial.println(yaw_rate_ref ) ;
+
+  } 
+}
