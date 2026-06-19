@@ -1,0 +1,48 @@
+//#include <Servo.h>
+
+//Servo esc1,esc2,esc3,esc4;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // Give serial time to open
+	pinMode(6, OUTPUT);  // pin, min pulse, max pulse in microseconds
+  pinMode(9,  OUTPUT);  // pin, min pulse, max pulse in microseconds 
+  pinMode(14,  OUTPUT);  // pin, min pulse, max pulse in microseconds  
+  pinMode(23,  OUTPUT);  // pin, min pulse, max pulse in microseconds
+  analogWriteFrequency(6, 450);
+  analogWriteFrequency(9, 450);
+  analogWriteFrequency(14, 450);
+  analogWriteFrequency(23, 450);
+  analogWriteResolution(12);
+
+  Serial.println("ESC Calibration Starting...");
+  Serial.println("===> DISCONNECT battery now if connected!");
+  Serial.println("===> You will be prompted when to connect power.");
+  delay(5000);
+
+  Serial.println("Step 1: Sending MAX throttle (2000 µs)...");
+  analogWrite(6, 3686); // Arm ESC
+  analogWrite(9, 3686); // Arm ESC  
+  analogWrite(14, 3686); // Arm ESC
+  analogWrite(23, 3686); // Arm ESC
+  Serial.println("===> NOW CONNECT BATTERY TO ESC.");
+  Serial.println("Wait for beeps...");
+  delay(4000);  // Wait for ESC to recognize max signal
+
+  Serial.println("Step 2: Sending MIN throttle (1000 µs)...");
+  analogWrite(6, 1843); // Arm ESC 
+  analogWrite(9, 1843); // Arm ESC
+  analogWrite(14, 1843); // Arm ESC
+  analogWrite(23, 1843); // Arm ESC  Serial.println("ESC should beep again and store calibration.");
+  delay(4000);  // Wait for ESC to confirm
+
+  Serial.println("Calibration complete! ESC is now armed and idle.");
+}
+
+void loop() {
+  // Keep ESC idle
+  analogWrite(6, 1843); // Arm ESC 
+  analogWrite(9, 1843); // Arm ESC
+  analogWrite(14, 1843); // Arm ESC
+  analogWrite(23, 1843); // Arm ESC
+}
